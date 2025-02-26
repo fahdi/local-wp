@@ -10,6 +10,7 @@ setup_system() {
   
   # Create main directory
   mkdir -p ~/Local-Sites/proxy
+  mkdir -p ~/Local-Sites/mailhog
   cd ~/Local-Sites
   
   # Create Docker network for all sites
@@ -17,8 +18,6 @@ setup_system() {
   
   # Create docker-compose for proxy with SSL support for .local domains
   cat > ~/Local-Sites/proxy/docker-compose.yml << 'EOF'
-version: '3'
-
 services:
   nginx-proxy:
     image: jwilder/nginx-proxy:alpine
@@ -38,8 +37,30 @@ services:
 
 networks:
   proxy-network:
-    external:
-      name: local-wp-network
+    external: true
+    name: local-wp-network
+EOF
+
+  # Set up MailHog mail catcher
+  cat > ~/Local-Sites/mailhog/docker-compose.yml << 'EOF'
+services:
+  mailhog:
+    image: mailhog/mailhog
+    container_name: local-wp-mailhog
+    ports:
+      - "1025:1025"  # SMTP port
+    environment:
+      - VIRTUAL_HOST=mail.local
+      - VIRTUAL_PORT=8025
+      - VIRTUAL_PROTO=http
+      - HTTPS_METHOD=redirect
+    networks:
+      - mailhog-network
+
+networks:
+  mailhog-network:
+    external: true
+    name: local-wp-network
 EOF
 
   # Create directories
@@ -57,9 +78,23 @@ EOF
 
   # Start proxy
   cd ~/Local-Sites/proxy
-  docker-compose up -d
+  docker compose up -d
   
-  echo "✅ Proxy system set up successfully!"
+  # Generate SSL cert for mail.local
+  generate_ssl_cert "mail.local"
+  
+  # Add mail.local to hosts file
+  if ! grep -q "mail.local" /etc/hosts; then
+    sudo bash -c "echo '127.0.0.1 mail.local' >> /etc/hosts"
+  fi
+  
+  # Start mailhog
+  cd ~/Local-Sites/mailhog
+  docker compose up -d
+  
+  echo "✅ Proxy system and MailHog set up successfully!"
+  echo "📧 Mail catcher UI available at: https://mail.local"
+  echo "📧 SMTP server available at: localhost:1025"
 }
 
 # Generate self-signed SSL certificate for a domain
@@ -103,8 +138,9 @@ create_site() {
     exit 1
   fi
   
-  # Create site directory
-  mkdir -p $SITE_DIR
+  # Create site directory structure for direct file access
+  mkdir -p $SITE_DIR/{wordpress,database,logs}
+  mkdir -p $SITE_DIR/wordpress/wp-content/mu-plugins
   cd $SITE_DIR
   
   # Generate random passwords
@@ -115,16 +151,14 @@ create_site() {
   generate_ssl_cert $SITE_DOMAIN
   generate_ssl_cert pma.$SITE_DOMAIN
   
-  # Create docker-compose.yml
+  # Create docker-compose.yml with bind mounts instead of volumes
   cat > docker-compose.yml << EOF
-version: '3'
-
 services:
   ${SITE_NAME}-db:
     image: mysql:8.0
     container_name: ${SITE_NAME}-db
     volumes:
-      - db_data:/var/lib/mysql
+      - ./database:/var/lib/mysql
     restart: unless-stopped
     environment:
       MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
@@ -140,7 +174,7 @@ services:
     depends_on:
       - ${SITE_NAME}-db
     volumes:
-      - wp_data:/var/www/html
+      - ./wordpress:/var/www/html
     restart: unless-stopped
     environment:
       WORDPRESS_DB_HOST: ${SITE_NAME}-db
@@ -171,13 +205,29 @@ services:
     networks:
       - local-wp-network
 
-volumes:
-  db_data:
-  wp_data:
-
 networks:
   local-wp-network:
     external: true
+    name: local-wp-network
+EOF
+
+  # Create a must-use plugin to configure WordPress to use MailHog for email
+  cat > wordpress/wp-content/mu-plugins/mailhog-config.php << 'EOF'
+<?php
+/**
+ * Plugin Name: Local Mail Configuration
+ * Description: Configures WordPress to use MailHog for email
+ * Version: 1.0
+ * Author: Local WP
+ */
+
+// Set the SMTP server to the MailHog container
+add_action('phpmailer_init', function($phpmailer) {
+    $phpmailer->Host = 'local-wp-mailhog';
+    $phpmailer->Port = 1025;
+    $phpmailer->SMTPAuth = false;
+    $phpmailer->isSMTP();
+});
 EOF
 
   # Create an .env file with environment variables
@@ -188,30 +238,67 @@ DB_PASSWORD=${DB_PASSWORD}
 DB_ROOT_PASSWORD=${DB_ROOT_PASSWORD}
 EOF
 
+  # Create a README file with site information
+  cat > README.md << EOF
+# WordPress Site: ${SITE_NAME}
+
+## Site Information
+- URL: https://${SITE_DOMAIN}
+- Database Admin: https://pma.${SITE_DOMAIN}
+- Mail Catcher: https://mail.local
+
+## Directory Structure
+- /wordpress: WordPress core files and content
+- /database: MySQL database files
+- /logs: Log files
+
+## Credentials
+### WordPress Database
+- Database Name: wordpress
+- Username: wordpress
+- Password: ${DB_PASSWORD}
+- Database Host: ${SITE_NAME}-db
+
+### Database Admin
+- Username: root
+- Password: ${DB_ROOT_PASSWORD}
+
+## Commands
+- Start site: docker compose up -d
+- Stop site: docker compose down
+- View logs: docker compose logs -f
+EOF
+
   # Update hosts file
   echo "Updating /etc/hosts file with ${SITE_DOMAIN}..."
   if ! grep -q "${SITE_DOMAIN}" /etc/hosts; then
     sudo bash -c "echo '127.0.0.1 ${SITE_DOMAIN} pma.${SITE_DOMAIN}' >> /etc/hosts"
   fi
   
+  # Set correct permissions
+  chmod -R 755 wordpress
+  
   # Start containers
-  docker-compose up -d
+  docker compose up -d
+  
+  # Wait for WordPress container to be ready (avoid race condition)
+  echo "Waiting for WordPress container to be ready..."
+  sleep 5
   
   echo "✅ WordPress site created successfully!"
   echo "🌐 Site URL: https://${SITE_DOMAIN}"
   echo "🛠 Database Admin: https://pma.${SITE_DOMAIN}"
+  echo "📧 Mail catcher UI: https://mail.local"
   echo "📁 Site directory: ${SITE_DIR}"
   echo ""
-  echo "Database credentials for wp-config.php:"
-  echo "  Database Name: wordpress"
-  echo "  Username: wordpress"
-  echo "  Password: ${DB_PASSWORD}"
-  echo "  Database Host: ${SITE_NAME}-db"
+  echo "📂 WordPress files are directly accessible at: ${SITE_DIR}/wordpress"
+  echo "📂 Database files are stored at: ${SITE_DIR}/database"
   echo ""
   echo "Once WordPress setup is complete, you can log in at:"
   echo "🔑 Admin URL: https://${SITE_DOMAIN}/wp-admin/"
   echo ""
   echo "⚠️ Since this uses self-signed certificates, you'll need to accept the security warning in your browser."
+  echo "📧 All emails sent from WordPress will be captured by MailHog and available at https://mail.local"
 }
 
 # ----- List All Sites -----
@@ -219,8 +306,12 @@ list_sites() {
   echo "WordPress Sites:"
   echo "================"
   
+  local site_count=0
+  
   for site in ~/Local-Sites/*/docker-compose.yml; do
-    if [ "$site" != "~/Local-Sites/*/docker-compose.yml" ] && [ "$site" != "~/Local-Sites/proxy/docker-compose.yml" ]; then
+    if [ "$site" != "~/Local-Sites/*/docker-compose.yml" ] && \
+       [ "$site" != "~/Local-Sites/proxy/docker-compose.yml" ] && \
+       [ "$site" != "~/Local-Sites/mailhog/docker-compose.yml" ]; then
       site_dir=$(dirname "$site")
       site_name=$(basename "$site_dir")
       site_domain="${site_name}.local"
@@ -233,8 +324,22 @@ list_sites() {
       fi
       
       echo "- ${site_name} (${site_domain}) - ${status}"
+      site_count=$((site_count + 1))
     fi
   done
+  
+  if [ $site_count -eq 0 ]; then
+    echo "No WordPress sites found."
+  fi
+  
+  # Check mail system status
+  if docker ps --format '{{.Names}}' | grep -q "local-wp-mailhog"; then
+    echo ""
+    echo "Mail System: ✅ Running (https://mail.local)"
+  else
+    echo ""
+    echo "Mail System: ❌ Stopped"
+  fi
 }
 
 # ----- Start Site -----
@@ -248,7 +353,7 @@ start_site() {
   fi
   
   cd $SITE_DIR
-  docker-compose up -d
+  docker compose up -d
   
   echo "✅ Site started: ${SITE_NAME}.local"
 }
@@ -264,7 +369,7 @@ stop_site() {
   fi
   
   cd $SITE_DIR
-  docker-compose down
+  docker compose down
   
   echo "✅ Site stopped: $SITE_NAME"
 }
@@ -288,7 +393,7 @@ delete_site() {
   
   # Stop containers
   cd $SITE_DIR
-  docker-compose down -v
+  docker compose down
   
   # Remove site directory
   cd ~/Local-Sites
@@ -304,6 +409,105 @@ delete_site() {
   echo "✅ Site deleted: $SITE_NAME"
 }
 
+# ----- Delete All Sites -----
+delete_all_sites() {
+  # Count sites
+  local site_count=0
+  local site_list=""
+  
+  for site in ~/Local-Sites/*/docker-compose.yml; do
+    if [ "$site" != "~/Local-Sites/*/docker-compose.yml" ] && \
+       [ "$site" != "~/Local-Sites/proxy/docker-compose.yml" ] && \
+       [ "$site" != "~/Local-Sites/mailhog/docker-compose.yml" ]; then
+      site_dir=$(dirname "$site")
+      site_name=$(basename "$site_dir")
+      site_list="${site_list}  - ${site_name}\n"
+      site_count=$((site_count + 1))
+    fi
+  done
+  
+  if [ $site_count -eq 0 ]; then
+    echo "No WordPress sites found to delete."
+    return
+  fi
+  
+  # Confirm deletion of all sites
+  echo "The following WordPress sites will be deleted:"
+  echo -e "$site_list"
+  read -p "Are you sure you want to delete ALL sites? This will remove all data! (yes/no): " CONFIRM
+  
+  if [[ "$CONFIRM" != "yes" ]]; then
+    echo "Operation cancelled."
+    return
+  fi
+  
+  # Double confirmation with site count
+  read -p "Please confirm once more - delete ALL $site_count sites? Type the site count to confirm: " COUNT_CONFIRM
+  
+  if [[ "$COUNT_CONFIRM" != "$site_count" ]]; then
+    echo "Incorrect confirmation. Operation cancelled."
+    return
+  fi
+  
+  # Delete all sites
+  for site in ~/Local-Sites/*/docker-compose.yml; do
+    if [ "$site" != "~/Local-Sites/*/docker-compose.yml" ] && \
+       [ "$site" != "~/Local-Sites/proxy/docker-compose.yml" ] && \
+       [ "$site" != "~/Local-Sites/mailhog/docker-compose.yml" ]; then
+      site_dir=$(dirname "$site")
+      site_name=$(basename "$site_dir")
+      site_domain="${site_name}.local"
+      
+      echo "Deleting site: $site_name..."
+      
+      # Stop containers
+      cd "$site_dir"
+      docker compose down
+      
+      # Remove site directory
+      cd ~/Local-Sites
+      rm -rf "$site_dir"
+      
+      # Remove SSL certificates
+      rm -f ~/Local-Sites/proxy/certs/${site_domain}.*
+      rm -f ~/Local-Sites/proxy/certs/pma.${site_domain}.*
+      
+      # Remove hosts file entry
+      sudo sed -i.bak "/^127.0.0.1 ${site_domain}/d" /etc/hosts
+      
+      echo "✅ Site deleted: $site_name"
+    fi
+  done
+  
+  echo "🗑️ All WordPress sites have been deleted."
+}
+
+# ----- Start Mail System -----
+start_mail() {
+  cd ~/Local-Sites/mailhog
+  
+  if [ ! -f "docker-compose.yml" ]; then
+    echo "❌ Mail system not set up. Please run setup first."
+    return
+  fi
+  
+  docker compose up -d
+  echo "✅ Mail system started. Web UI: https://mail.local"
+}
+
+# ----- Stop Mail System -----
+stop_mail() {
+  cd ~/Local-Sites/mailhog
+  
+  if [ ! -f "docker-compose.yml" ]; then
+    echo "❌ Mail system not set up. Please run setup first."
+    return
+  fi
+  
+  docker compose down
+  echo "✅ Mail system stopped."
+}
+
 # ----- Main Menu -----
 main_menu() {
   clear
@@ -316,7 +520,10 @@ main_menu() {
   echo "4. Start a site"
   echo "5. Stop a site"
   echo "6. Delete a site"
-  echo "7. Exit"
+  echo "7. Delete ALL sites"
+  echo "8. Start mail system"
+  echo "9. Stop mail system"
+  echo "10. Exit"
   echo "==========================================="
   read -p "Enter your choice: " CHOICE
   
@@ -327,7 +534,10 @@ main_menu() {
     4) start_site ;;
     5) stop_site ;;
     6) delete_site ;;
-    7) exit 0 ;;
+    7) delete_all_sites ;;
+    8) start_mail ;;
+    9) stop_mail ;;
+    10) exit 0 ;;
     *) echo "Invalid choice. Please try again." ;;
   esac
   
