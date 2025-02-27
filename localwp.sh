@@ -11,6 +11,7 @@ setup_system() {
   # Create main directory
   mkdir -p ~/Local-Sites/proxy
   mkdir -p ~/Local-Sites/mailhog
+  mkdir -p ~/Local-Sites/backups
   cd ~/Local-Sites
   
   # Create Docker network for all sites
@@ -63,6 +64,91 @@ networks:
     name: local-wp-network
 EOF
 
+  # Set up backup system scheduler
+  cat > ~/Local-Sites/backups/docker-compose.yml << 'EOF'
+version: '3'
+
+services:
+  backup-scheduler:
+    image: mcuadros/ofelia:latest
+    container_name: wp-backup-scheduler
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./config.ini:/etc/ofelia/config.ini
+      - ../:/sites:ro
+      - ./:/backups
+    restart: unless-stopped
+    networks:
+      - backup-network
+
+networks:
+  backup-network:
+    external: true
+    name: local-wp-network
+EOF
+
+  # Create scheduler configuration file
+  cat > ~/Local-Sites/backups/config.ini << 'EOF'
+[global]
+# Backup schedule configuration
+
+[job-exec "backup-all-sites"]
+schedule = @daily
+container = wp-backup-scheduler
+command = /bin/sh -c "cd /backups && ./backup-all-sites.sh"
+EOF
+
+  # Create backup script for all sites
+  cat > ~/Local-Sites/backups/backup-all-sites.sh << 'EOF'
+#!/bin/bash
+
+BACKUP_ROOT="/backups"
+DATE=$(date +"%Y-%m-%d")
+echo "Starting backup of all WordPress sites at $(date)"
+
+# Find all WordPress sites
+for site_dir in /sites/*/; do
+  if [ -f "${site_dir}docker-compose.yml" ]; then
+    site_name=$(basename "${site_dir}")
+    
+    # Skip proxy and mailhog directories
+    if [[ "$site_name" != "proxy" && "$site_name" != "mailhog" && "$site_name" != "backups" ]]; then
+      echo "Backing up site: $site_name"
+      
+      # Create backup directory for site
+      mkdir -p "${BACKUP_ROOT}/${site_name}"
+      
+      # Get database password from .env file if it exists
+      if [ -f "${site_dir}.env" ]; then
+        DB_PASSWORD=$(grep DB_PASSWORD "${site_dir}.env" | cut -d '=' -f2)
+      else
+        DB_PASSWORD="wordpress"  # Default password if .env not found
+      fi
+      
+      # Create backup of database - only if container is running
+      if docker ps --format '{{.Names}}' | grep -q "${site_name}-db"; then
+        echo "  - Backing up database..."
+        docker exec "${site_name}-db" mysqldump -u wordpress -p${DB_PASSWORD} wordpress > "${BACKUP_ROOT}/${site_name}/${DATE}-${site_name}-db.sql"
+        echo "  ✅ Backup completed for $site_name"
+      else
+        echo "  ⚠️ Database container not running for $site_name, skipping backup"
+      fi
+    fi
+  fi
+done
+
+echo "Backup process completed at $(date)"
+
+# Cleanup old backups (keep last 7 days)
+echo "Cleaning up old backups..."
+find "${BACKUP_ROOT}" -type f -name "*.sql" -mtime +7 -delete
+
+echo "All operations completed successfully"
+EOF
+
+  # Make the script executable
+  chmod +x ~/Local-Sites/backups/backup-all-sites.sh
+
   # Create directories
   mkdir -p ~/Local-Sites/proxy/{certs,vhost.d,html,conf.d}
   
@@ -94,13 +180,17 @@ EOF
     sudo bash -c "echo '127.0.0.1 mail.local' >> /etc/hosts"
   fi
   
-  # Start mailhog
+  # Start mailhog and backup scheduler
   cd ~/Local-Sites/mailhog
   docker compose up -d
   
-  echo "✅ Proxy system and MailHog set up successfully!"
+  cd ~/Local-Sites/backups
+  docker compose up -d
+  
+  echo "✅ Proxy system, MailHog, and backup system set up successfully!"
   echo "📧 Mail catcher UI available at: https://mail.local"
   echo "📧 SMTP server available at: localhost:1025"
+  echo "💾 Automated daily backups enabled"
 }
 
 # Generate self-signed SSL certificate for a domain
@@ -312,6 +402,11 @@ This site is configured with increased upload limits:
 - Post max size: 128MB 
 - Memory limit: 256MB
 - Max execution time: 300 seconds
+
+## Backup Information
+- Automatic daily backups are enabled
+- Backup files are stored in ~/Local-Sites/backups/${SITE_NAME}/
+- Backups can be managed through the Local WP tool
 EOF
 
   # Update hosts file
@@ -325,6 +420,9 @@ EOF
   
   # Start containers
   docker compose up -d
+  
+  # Create backup directory
+  mkdir -p ~/Local-Sites/backups/${SITE_NAME}
   
   # Wait for WordPress container to be ready (avoid race condition)
   echo "Waiting for WordPress container to be ready..."
@@ -340,6 +438,7 @@ EOF
   echo "📂 Database files are stored at: ${SITE_DIR}/database"
   echo ""
   echo "🔄 Upload limits have been increased to 128MB"
+  echo "💾 Daily backups will be stored in ~/Local-Sites/backups/${SITE_NAME}/"
   echo ""
   echo "Once WordPress setup is complete, you can log in at:"
   echo "🔑 Admin URL: https://${SITE_DOMAIN}/wp-admin/"
@@ -414,6 +513,177 @@ EOF
   echo "🔄 Changes will take effect after container restart"
 }
 
+# ----- Manual Database Backup -----
+backup_site() {
+  read -p "Enter site name to backup: " SITE_NAME
+  SITE_DIR=~/Local-Sites/${SITE_NAME}
+  
+  if [ ! -d "$SITE_DIR" ]; then
+    echo "❌ Site not found: $SITE_NAME"
+    return
+  fi
+  
+  # Create backup directory if it doesn't exist
+  BACKUP_DIR=~/Local-Sites/backups/${SITE_NAME}
+  mkdir -p $BACKUP_DIR
+  
+  # Get database password from .env file if it exists
+  if [ -f "$SITE_DIR/.env" ]; then
+    DB_PASSWORD=$(grep DB_PASSWORD "$SITE_DIR/.env" | cut -d '=' -f2)
+  else
+    DB_PASSWORD="wordpress"  # Default password if .env not found
+  fi
+  
+  # Create timestamp for backup file
+  TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
+  BACKUP_FILE="${BACKUP_DIR}/${TIMESTAMP}-${SITE_NAME}-backup.sql"
+  
+  echo "Backing up database for site: $SITE_NAME"
+  
+  # Check if site is running
+  if ! docker ps | grep -q "${SITE_NAME}-db"; then
+    echo "⚠️ Site is not running. Starting containers..."
+    cd "$SITE_DIR"
+    docker compose up -d
+    sleep 5  # Give containers time to start
+  fi
+  
+  # Perform the database backup
+  if docker exec "${SITE_NAME}-db" mysqldump -u wordpress -p${DB_PASSWORD} wordpress > "$BACKUP_FILE"; then
+    echo "✅ Database backup created successfully!"
+    echo "📁 Backup location: $BACKUP_FILE"
+    echo "📊 Backup size: $(du -h "$BACKUP_FILE" | cut -f1)"
+  else
+    echo "❌ Backup failed. Please check if the site is running."
+  fi
+}
+
+# ----- Restore Database Backup -----
+restore_backup() {
+  read -p "Enter site name to restore backup for: " SITE_NAME
+  SITE_DIR=~/Local-Sites/${SITE_NAME}
+  BACKUP_DIR=~/Local-Sites/backups/${SITE_NAME}
+  
+  if [ ! -d "$SITE_DIR" ]; then
+    echo "❌ Site not found: $SITE_NAME"
+    return
+  fi
+  
+  if [ ! -d "$BACKUP_DIR" ] || [ -z "$(ls -A "$BACKUP_DIR")" ]; then
+    echo "❌ No backups found for site: $SITE_NAME"
+    return
+  fi
+  
+  # List available backups
+  echo "Available backups for $SITE_NAME:"
+  ls -1t "$BACKUP_DIR" | grep -E '\.sql$' | nl
+  
+  # Get backup selection
+  read -p "Enter the number of the backup to restore: " BACKUP_NUM
+  BACKUP_FILE=$(ls -1t "$BACKUP_DIR" | grep -E '\.sql$' | sed -n "${BACKUP_NUM}p")
+  
+  if [ -z "$BACKUP_FILE" ]; then
+    echo "❌ Invalid selection."
+    return
+  fi
+  
+  FULL_BACKUP_PATH="${BACKUP_DIR}/${BACKUP_FILE}"
+  
+  # Get database password from .env file if it exists
+  if [ -f "$SITE_DIR/.env" ]; then
+    DB_PASSWORD=$(grep DB_PASSWORD "$SITE_DIR/.env" | cut -d '=' -f2)
+  else
+    DB_PASSWORD="wordpress"  # Default password if .env not found
+  fi
+  
+  # Confirm restoration
+  echo "You are about to restore the database for $SITE_NAME from backup:"
+  echo "  $BACKUP_FILE ($(du -h "$FULL_BACKUP_PATH" | cut -f1))"
+  echo "⚠️ Warning: This will overwrite all current data in the database!"
+  read -p "Are you sure you want to proceed? (y/n): " CONFIRM
+  
+  if [[ "$CONFIRM" != "y" ]]; then
+    echo "Operation cancelled."
+    return
+  fi
+  
+  # Check if site is running
+  if ! docker ps | grep -q "${SITE_NAME}-db"; then
+    echo "⚠️ Site is not running. Starting containers..."
+    cd "$SITE_DIR"
+    docker compose up -d
+    sleep 5  # Give containers time to start
+  fi
+  
+  # Perform the restoration
+  echo "Restoring database from backup..."
+  if cat "$FULL_BACKUP_PATH" | docker exec -i "${SITE_NAME}-db" mysql -u wordpress -p${DB_PASSWORD} wordpress; then
+    echo "✅ Database restored successfully!"
+  else
+    echo "❌ Restoration failed. Please check the backup file and try again."
+  fi
+}
+
+# ----- Run Backup For All Sites -----
+backup_all_sites() {
+  echo "Running backup for all WordPress sites..."
+  
+  # Check if backup scheduler is running
+  if ! docker ps | grep -q "wp-backup-scheduler"; then
+    echo "⚠️ Backup scheduler is not running. Starting it..."
+    cd ~/Local-Sites/backups
+    docker compose up -d
+    sleep 2
+  fi
+  
+  # Execute backup script in container
+  if docker exec wp-backup-scheduler /bin/sh -c "cd /backups && ./backup-all-sites.sh"; then
+    echo "✅ All sites backed up successfully!"
+  else
+    echo "❌ Backup process encountered errors. Check the logs for details."
+  fi
+}
+
+# ----- List All Backups -----
+list_backups() {
+  BACKUP_DIR=~/Local-Sites/backups
+  
+  if [ ! -d "$BACKUP_DIR" ]; then
+    echo "No backups found. Backup system may not be set up."
+    return
+  fi
+  
+  echo "WordPress Site Backups:"
+  echo "======================="
+  
+  # Loop through site directories in backups
+  for site_backup in $BACKUP_DIR/*/; do
+    if [ "$site_backup" != "$BACKUP_DIR/*/" ]; then
+      site_name=$(basename "$site_backup")
+      
+      # Skip non-site directories
+      if [[ "$site_name" != "proxy" && "$site_name" != "mailhog" && ! -f "$site_backup/docker-compose.yml" ]]; then
+        echo "Site: $site_name"
+        
+        # Count backups and get latest backup date
+        backup_count=$(find "$site_backup" -name "*.sql" | wc -l)
+        
+        if [ "$backup_count" -gt 0 ]; then
+          latest_backup=$(find "$site_backup" -name "*.sql" | sort -r | head -n 1)
+          latest_date=$(basename "$latest_backup" | grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2}')
+          
+          echo "  - $backup_count backups found"
+          echo "  - Latest backup: $latest_date"
+          echo "  - Total backup size: $(du -sh "$site_backup" | cut -f1)"
+        else
+          echo "  - No backups found"
+        fi
+        echo ""
+      fi
+    fi
+  done
+}
+
 # ----- List All Sites -----
 list_sites() {
   echo "WordPress Sites:"
@@ -424,7 +694,8 @@ list_sites() {
   for site in ~/Local-Sites/*/docker-compose.yml; do
     if [ "$site" != "~/Local-Sites/*/docker-compose.yml" ] && \
        [ "$site" != "~/Local-Sites/proxy/docker-compose.yml" ] && \
-       [ "$site" != "~/Local-Sites/mailhog/docker-compose.yml" ]; then
+       [ "$site" != "~/Local-Sites/mailhog/docker-compose.yml" ] && \
+       [ "$site" != "~/Local-Sites/backups/docker-compose.yml" ]; then
       site_dir=$(dirname "$site")
       site_name=$(basename "$site_dir")
       site_domain="${site_name}.local"
@@ -435,8 +706,16 @@ list_sites() {
       else
         status="❌ Stopped"
       fi
+
+      # Check if backups exist
+      backup_count=$(find ~/Local-Sites/backups/${site_name} -name "*.sql" 2>/dev/null | wc -l)
+      if [ "$backup_count" -gt 0 ]; then
+        backup_status="💾 $backup_count backups"
+      else
+        backup_status="⚠️ No backups"
+      fi
       
-      echo "- ${site_name} (${site_domain}) - ${status}"
+      echo "- ${site_name} (${site_domain}) - ${status} - ${backup_status}"
       site_count=$((site_count + 1))
     fi
   done
@@ -445,13 +724,29 @@ list_sites() {
     echo "No WordPress sites found."
   fi
   
+  # Check system services status
+  echo ""
+  echo "System Services:"
+  
+  # Check proxy status
+  if docker ps --format '{{.Names}}' | grep -q "local-wp-proxy"; then
+    echo "- Proxy: ✅ Running"
+  else
+    echo "- Proxy: ❌ Stopped"
+  fi
+  
   # Check mail system status
   if docker ps --format '{{.Names}}' | grep -q "local-wp-mailhog"; then
-    echo ""
-    echo "Mail System: ✅ Running (https://mail.local)"
+    echo "- Mail System: ✅ Running (https://mail.local)"
   else
-    echo ""
-    echo "Mail System: ❌ Stopped"
+    echo "- Mail System: ❌ Stopped"
+  fi
+  
+  # Check backup scheduler status
+  if docker ps --format '{{.Names}}' | grep -q "wp-backup-scheduler"; then
+    echo "- Backup System: ✅ Running (Daily Schedule)"
+  else
+    echo "- Backup System: ❌ Stopped"
   fi
 }
 
@@ -504,6 +799,11 @@ delete_site() {
     exit 0
   fi
   
+  # Ask about backups
+  if [ -d "~/Local-Sites/backups/${SITE_NAME}" ]; then
+    read -p "Do you want to keep the backups for this site? (y/n): " KEEP_BACKUPS
+  fi
+  
   # Stop containers
   cd $SITE_DIR
   docker compose down
@@ -519,147 +819,6 @@ delete_site() {
   # Remove hosts file entry
   sudo sed -i.bak "/^127.0.0.1 ${SITE_DOMAIN}/d" /etc/hosts
   
-  echo "✅ Site deleted: $SITE_NAME"
-}
-
-# ----- Delete All Sites -----
-delete_all_sites() {
-  # Count sites
-  local site_count=0
-  local site_list=""
-  
-  for site in ~/Local-Sites/*/docker-compose.yml; do
-    if [ "$site" != "~/Local-Sites/*/docker-compose.yml" ] && \
-       [ "$site" != "~/Local-Sites/proxy/docker-compose.yml" ] && \
-       [ "$site" != "~/Local-Sites/mailhog/docker-compose.yml" ]; then
-      site_dir=$(dirname "$site")
-      site_name=$(basename "$site_dir")
-      site_list="${site_list}  - ${site_name}\n"
-      site_count=$((site_count + 1))
-    fi
-  done
-  
-  if [ $site_count -eq 0 ]; then
-    echo "No WordPress sites found to delete."
-    return
-  fi
-  
-  # Confirm deletion of all sites
-  echo "The following WordPress sites will be deleted:"
-  echo -e "$site_list"
-  read -p "Are you sure you want to delete ALL sites? This will remove all data! (yes/no): " CONFIRM
-  
-  if [[ "$CONFIRM" != "yes" ]]; then
-    echo "Operation cancelled."
-    return
-  fi
-  
-  # Double confirmation with site count
-  read -p "Please confirm once more - delete ALL $site_count sites? Type the site count to confirm: " COUNT_CONFIRM
-  
-  if [[ "$COUNT_CONFIRM" != "$site_count" ]]; then
-    echo "Incorrect confirmation. Operation cancelled."
-    return
-  fi
-  
-  # Delete all sites
-  for site in ~/Local-Sites/*/docker-compose.yml; do
-    if [ "$site" != "~/Local-Sites/*/docker-compose.yml" ] && \
-       [ "$site" != "~/Local-Sites/proxy/docker-compose.yml" ] && \
-       [ "$site" != "~/Local-Sites/mailhog/docker-compose.yml" ]; then
-      site_dir=$(dirname "$site")
-      site_name=$(basename "$site_dir")
-      site_domain="${site_name}.local"
-      
-      echo "Deleting site: $site_name..."
-      
-      # Stop containers
-      cd "$site_dir"
-      docker compose down
-      
-      # Remove site directory
-      cd ~/Local-Sites
-      rm -rf "$site_dir"
-      
-      # Remove SSL certificates
-      rm -f ~/Local-Sites/proxy/certs/${site_domain}.*
-      rm -f ~/Local-Sites/proxy/certs/pma.${site_domain}.*
-      
-      # Remove hosts file entry
-      sudo sed -i.bak "/^127.0.0.1 ${site_domain}/d" /etc/hosts
-      
-      echo "✅ Site deleted: $site_name"
-    fi
-  done
-  
-  echo "🗑️ All WordPress sites have been deleted."
-}
-
-# ----- Start Mail System -----
-start_mail() {
-  cd ~/Local-Sites/mailhog
-  
-  if [ ! -f "docker-compose.yml" ]; then
-    echo "❌ Mail system not set up. Please run setup first."
-    return
-  fi
-  
-  docker compose up -d
-  echo "✅ Mail system started. Web UI: https://mail.local"
-}
-
-# ----- Stop Mail System -----
-stop_mail() {
-  cd ~/Local-Sites/mailhog
-  
-  if [ ! -f "docker-compose.yml" ]; then
-    echo "❌ Mail system not set up. Please run setup first."
-    return
-  fi
-  
-  docker compose down
-  echo "✅ Mail system stopped."
-}
-
-# ----- Main Menu -----
-main_menu() {
-  clear
-  echo "===========================================" 
-  echo "      WordPress Local Development Tool     "
-  echo "===========================================" 
-  echo "1. First-time setup (run once)"
-  echo "2. Create new WordPress site"
-  echo "3. List all sites"
-  echo "4. Start a site"
-  echo "5. Stop a site"
-  echo "6. Delete a site"
-  echo "7. Delete ALL sites"
-  echo "8. Start mail system"
-  echo "9. Stop mail system"
-  echo "10. Fix upload limits for existing site"
-  echo "11. Exit"
-  echo "==========================================="
-  read -p "Enter your choice: " CHOICE
-  
-  case $CHOICE in
-    1) setup_system ;;
-    2) create_site ;;
-    3) list_sites ;;
-    4) start_site ;;
-    5) stop_site ;;
-    6) delete_site ;;
-    7) delete_all_sites ;;
-    8) start_mail ;;
-    9) stop_mail ;;
-    10) fix_uploads ;;
-    11) exit 0 ;;
-    *) echo "Invalid choice. Please try again." ;;
-  esac
-  
-  echo ""
-  read -p "Press Enter to return to menu..."
-  main_menu
-}
-
-# Start the menu
-main_menu
+  # Remove backups if requested
+  if [[ "$KEEP_BACKUPS" != "y" ]]; then
+    rm -rf ~/Local-Sites/backups/${
