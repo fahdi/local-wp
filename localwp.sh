@@ -783,6 +783,7 @@ stop_site() {
 }
 
 # ----- Delete Site -----
+# ----- Delete Site -----
 delete_site() {
   read -p "Enter site name to delete: " SITE_NAME
   SITE_DIR=~/Local-Sites/${SITE_NAME}
@@ -821,4 +822,214 @@ delete_site() {
   
   # Remove backups if requested
   if [[ "$KEEP_BACKUPS" != "y" ]]; then
-    rm -rf ~/Local-Sites/backups/${
+    rm -rf ~/Local-Sites/backups/${SITE_NAME}
+    echo "🗑️ Site backups deleted"
+  else
+    echo "💾 Site backups preserved in ~/Local-Sites/backups/${SITE_NAME}"
+  fi
+  
+  echo "✅ Site deleted: $SITE_NAME"
+}
+
+# ----- Delete All Sites -----
+delete_all_sites() {
+  # Count sites
+  local site_count=0
+  local site_list=""
+  
+  for site in ~/Local-Sites/*/docker-compose.yml; do
+    if [ "$site" != "~/Local-Sites/*/docker-compose.yml" ] && \
+       [ "$site" != "~/Local-Sites/proxy/docker-compose.yml" ] && \
+       [ "$site" != "~/Local-Sites/mailhog/docker-compose.yml" ] && \
+       [ "$site" != "~/Local-Sites/backups/docker-compose.yml" ]; then
+      site_dir=$(dirname "$site")
+      site_name=$(basename "$site_dir")
+      site_list="${site_list}  - ${site_name}\n"
+      site_count=$((site_count + 1))
+    fi
+  done
+  
+  if [ $site_count -eq 0 ]; then
+    echo "No WordPress sites found to delete."
+    return
+  fi
+  
+  # Confirm deletion of all sites
+  echo "The following WordPress sites will be deleted:"
+  echo -e "$site_list"
+  read -p "Are you sure you want to delete ALL sites? This will remove all data! (yes/no): " CONFIRM
+  
+  if [[ "$CONFIRM" != "yes" ]]; then
+    echo "Operation cancelled."
+    return
+  fi
+  
+  # Double confirmation with site count
+  read -p "Please confirm once more - delete ALL $site_count sites? Type the site count to confirm: " COUNT_CONFIRM
+  
+  if [[ "$COUNT_CONFIRM" != "$site_count" ]]; then
+    echo "Incorrect confirmation. Operation cancelled."
+    return
+  fi
+  
+  # Ask about backups
+  read -p "Do you want to keep the backups for ALL sites? (y/n): " KEEP_BACKUPS
+  
+  # Delete all sites
+  for site in ~/Local-Sites/*/docker-compose.yml; do
+    if [ "$site" != "~/Local-Sites/*/docker-compose.yml" ] && \
+       [ "$site" != "~/Local-Sites/proxy/docker-compose.yml" ] && \
+       [ "$site" != "~/Local-Sites/mailhog/docker-compose.yml" ] && \
+       [ "$site" != "~/Local-Sites/backups/docker-compose.yml" ]; then
+      site_dir=$(dirname "$site")
+      site_name=$(basename "$site_dir")
+      site_domain="${site_name}.local"
+      
+      echo "Deleting site: $site_name..."
+      
+      # Stop containers
+      cd "$site_dir"
+      docker compose down
+      
+      # Remove site directory
+      cd ~/Local-Sites
+      rm -rf "$site_dir"
+      
+      # Remove SSL certificates
+      rm -f ~/Local-Sites/proxy/certs/${site_domain}.*
+      rm -f ~/Local-Sites/proxy/certs/pma.${site_domain}.*
+      
+      # Remove hosts file entry
+      sudo sed -i.bak "/^127.0.0.1 ${site_domain}/d" /etc/hosts
+      
+      # Remove backups if requested
+      if [[ "$KEEP_BACKUPS" != "y" ]]; then
+        rm -rf ~/Local-Sites/backups/${site_name}
+      fi
+      
+      echo "✅ Site deleted: $site_name"
+    fi
+  done
+  
+  if [[ "$KEEP_BACKUPS" == "y" ]]; then
+    echo "💾 All site backups preserved in ~/Local-Sites/backups/"
+  else
+    echo "🗑️ All site backups have been deleted"
+  fi
+  
+  echo "🗑️ All WordPress sites have been deleted."
+}
+
+# ----- Start Mail System -----
+start_mail() {
+  cd ~/Local-Sites/mailhog
+  
+  if [ ! -f "docker-compose.yml" ]; then
+    echo "❌ Mail system not set up. Please run setup first."
+    return
+  fi
+  
+  docker compose up -d
+  echo "✅ Mail system started. Web UI: https://mail.local"
+}
+
+# ----- Stop Mail System -----
+stop_mail() {
+  cd ~/Local-Sites/mailhog
+  
+  if [ ! -f "docker-compose.yml" ]; then
+    echo "❌ Mail system not set up. Please run setup first."
+    return
+  fi
+  
+  docker compose down
+  echo "✅ Mail system stopped."
+}
+
+# ----- Start Backup System -----
+start_backup() {
+  cd ~/Local-Sites/backups
+  
+  if [ ! -f "docker-compose.yml" ]; then
+    echo "❌ Backup system not set up. Please run setup first."
+    return
+  fi
+  
+  docker compose up -d
+  echo "✅ Backup system started. Daily backups are now enabled."
+}
+
+# ----- Stop Backup System -----
+stop_backup() {
+  cd ~/Local-Sites/backups
+  
+  if [ ! -f "docker-compose.yml" ]; then
+    echo "❌ Backup system not set up. Please run setup first."
+    return
+  fi
+  
+  docker compose down
+  echo "✅ Backup system stopped. Daily backups are now disabled."
+}
+
+# ----- Main Menu -----
+main_menu() {
+  clear
+  echo "===========================================" 
+  echo "      WordPress Local Development Tool     "
+  echo "===========================================" 
+  echo "1. First-time setup (run once)"
+  echo "2. Create new WordPress site"
+  echo "3. List all sites"
+  echo "4. Start a site"
+  echo "5. Stop a site"
+  echo "6. Delete a site"
+  echo "7. Delete ALL sites"
+  echo ""
+  echo "--- System Services ---"
+  echo "8. Start mail system"
+  echo "9. Stop mail system"
+  echo "10. Start backup system"
+  echo "11. Stop backup system"
+  echo ""
+  echo "--- Maintenance ---"
+  echo "12. Fix upload limits for existing site"
+  echo ""
+  echo "--- Backup Operations ---"
+  echo "13. Backup a site manually"
+  echo "14. Backup ALL sites now"
+  echo "15. Restore from backup"
+  echo "16. List all backups"
+  echo ""
+  echo "17. Exit"
+  echo "==========================================="
+  read -p "Enter your choice: " CHOICE
+  
+  case $CHOICE in
+    1) setup_system ;;
+    2) create_site ;;
+    3) list_sites ;;
+    4) start_site ;;
+    5) stop_site ;;
+    6) delete_site ;;
+    7) delete_all_sites ;;
+    8) start_mail ;;
+    9) stop_mail ;;
+    10) start_backup ;;
+    11) stop_backup ;;
+    12) fix_uploads ;;
+    13) backup_site ;;
+    14) backup_all_sites ;;
+    15) restore_backup ;;
+    16) list_backups ;;
+    17) exit 0 ;;
+    *) echo "Invalid choice. Please try again." ;;
+  esac
+  
+  echo ""
+  read -p "Press Enter to return to menu..."
+  main_menu
+}
+
+# Start the menu
+main_menu
