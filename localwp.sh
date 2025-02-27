@@ -76,6 +76,12 @@ ssl_session_cache shared:SSL:10m;
 ssl_session_timeout 10m;
 EOF
 
+  # Create uploads configuration to increase file size limits
+  cat > ~/Local-Sites/proxy/conf.d/uploads.conf << 'EOF'
+# Increase upload size limits
+client_max_body_size 128M;
+EOF
+
   # Start proxy
   cd ~/Local-Sites/proxy
   docker compose up -d
@@ -141,6 +147,7 @@ create_site() {
   # Create site directory structure for direct file access
   mkdir -p $SITE_DIR/{wordpress,database,logs}
   mkdir -p $SITE_DIR/wordpress/wp-content/mu-plugins
+  mkdir -p $SITE_DIR/wordpress/uploads-config  # Directory for upload configuration
   cd $SITE_DIR
   
   # Generate random passwords
@@ -150,6 +157,16 @@ create_site() {
   # Generate SSL certificate for the domain
   generate_ssl_cert $SITE_DOMAIN
   generate_ssl_cert pma.$SITE_DOMAIN
+  
+  # Create custom PHP configuration for file uploads
+  cat > $SITE_DIR/wordpress/uploads-config/php.ini << 'EOF'
+; Custom PHP settings for WordPress uploads
+upload_max_filesize = 128M
+post_max_size = 128M
+memory_limit = 256M
+max_execution_time = 300
+max_input_time = 300
+EOF
   
   # Create docker-compose.yml with bind mounts instead of volumes
   cat > docker-compose.yml << EOF
@@ -175,6 +192,7 @@ services:
       - ${SITE_NAME}-db
     volumes:
       - ./wordpress:/var/www/html
+      - ./wordpress/uploads-config/php.ini:/usr/local/etc/php/conf.d/uploads.ini
     restart: unless-stopped
     environment:
       WORDPRESS_DB_HOST: ${SITE_NAME}-db
@@ -202,6 +220,7 @@ services:
       VIRTUAL_PORT: 80
       VIRTUAL_PROTO: http
       HTTPS_METHOD: redirect
+      UPLOAD_LIMIT: 128M
     networks:
       - local-wp-network
 
@@ -228,6 +247,25 @@ add_action('phpmailer_init', function($phpmailer) {
     $phpmailer->SMTPAuth = false;
     $phpmailer->isSMTP();
 });
+EOF
+
+  # Create a must-use plugin to increase WordPress upload limits
+  cat > wordpress/wp-content/mu-plugins/upload-limits.php << 'EOF'
+<?php
+/**
+ * Plugin Name: Upload Limits Configuration
+ * Description: Increases WordPress upload limits
+ * Version: 1.0
+ * Author: Local WP
+ */
+
+// Increase WordPress upload limits
+add_filter('upload_size_limit', function($size) {
+    return 134217728; // 128MB in bytes
+});
+
+// Remove "Exceeds maximum upload size for this site" error
+add_filter('big_image_size_threshold', '__return_false');
 EOF
 
   # Create an .env file with environment variables
@@ -267,6 +305,13 @@ EOF
 - Start site: docker compose up -d
 - Stop site: docker compose down
 - View logs: docker compose logs -f
+
+## Upload Limits
+This site is configured with increased upload limits:
+- Maximum upload size: 128MB
+- Post max size: 128MB 
+- Memory limit: 256MB
+- Max execution time: 300 seconds
 EOF
 
   # Update hosts file
@@ -294,11 +339,79 @@ EOF
   echo "📂 WordPress files are directly accessible at: ${SITE_DIR}/wordpress"
   echo "📂 Database files are stored at: ${SITE_DIR}/database"
   echo ""
+  echo "🔄 Upload limits have been increased to 128MB"
+  echo ""
   echo "Once WordPress setup is complete, you can log in at:"
   echo "🔑 Admin URL: https://${SITE_DOMAIN}/wp-admin/"
   echo ""
   echo "⚠️ Since this uses self-signed certificates, you'll need to accept the security warning in your browser."
   echo "📧 All emails sent from WordPress will be captured by MailHog and available at https://mail.local"
+}
+
+# ----- Fix Upload Limits for Existing Site -----
+fix_uploads() {
+  read -p "Enter site name to fix uploads for: " SITE_NAME
+  SITE_DIR=~/Local-Sites/${SITE_NAME}
+  
+  if [ ! -d "$SITE_DIR" ]; then
+    echo "❌ Site not found: $SITE_NAME"
+    exit 1
+  fi
+  
+  echo "Fixing upload limits for site: $SITE_NAME"
+  
+  # Create uploads configuration directory if it doesn't exist
+  mkdir -p $SITE_DIR/wordpress/uploads-config
+  
+  # Create PHP configuration file for uploads
+  cat > $SITE_DIR/wordpress/uploads-config/php.ini << 'EOF'
+; Custom PHP settings for WordPress uploads
+upload_max_filesize = 128M
+post_max_size = 128M
+memory_limit = 256M
+max_execution_time = 300
+max_input_time = 300
+EOF
+
+  # Create must-use plugin to increase WordPress upload limits
+  mkdir -p $SITE_DIR/wordpress/wp-content/mu-plugins
+  cat > $SITE_DIR/wordpress/wp-content/mu-plugins/upload-limits.php << 'EOF'
+<?php
+/**
+ * Plugin Name: Upload Limits Configuration
+ * Description: Increases WordPress upload limits
+ * Version: 1.0
+ * Author: Local WP
+ */
+
+// Increase WordPress upload limits
+add_filter('upload_size_limit', function($size) {
+    return 134217728; // 128MB in bytes
+});
+
+// Remove "Exceeds maximum upload size for this site" error
+add_filter('big_image_size_threshold', '__return_false');
+EOF
+
+  # Update docker-compose.yml to include the PHP configuration
+  cd $SITE_DIR
+  
+  # Backup original docker-compose.yml
+  cp docker-compose.yml docker-compose.yml.bak
+  
+  # Update docker-compose.yml using sed
+  sed -i.bak '/\.\/wordpress:\/var\/www\/html/a\      - ./wordpress/uploads-config/php.ini:/usr/local/etc/php/conf.d/uploads.ini' docker-compose.yml
+  
+  # Add UPLOAD_LIMIT for phpMyAdmin if present
+  sed -i.bak '/PMA_PASSWORD/a\      UPLOAD_LIMIT: 128M' docker-compose.yml
+  
+  # Restart containers to apply changes
+  docker compose down
+  docker compose up -d
+  
+  echo "✅ Upload limits fixed for site: $SITE_NAME"
+  echo "🔄 Maximum upload size increased to 128MB"
+  echo "🔄 Changes will take effect after container restart"
 }
 
 # ----- List All Sites -----
@@ -523,7 +636,8 @@ main_menu() {
   echo "7. Delete ALL sites"
   echo "8. Start mail system"
   echo "9. Stop mail system"
-  echo "10. Exit"
+  echo "10. Fix upload limits for existing site"
+  echo "11. Exit"
   echo "==========================================="
   read -p "Enter your choice: " CHOICE
   
@@ -537,7 +651,8 @@ main_menu() {
     7) delete_all_sites ;;
     8) start_mail ;;
     9) stop_mail ;;
-    10) exit 0 ;;
+    10) fix_uploads ;;
+    11) exit 0 ;;
     *) echo "Invalid choice. Please try again." ;;
   esac
   
